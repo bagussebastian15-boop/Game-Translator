@@ -10,7 +10,7 @@
     <application
         android:allowBackup="false"
         android:icon="@android:drawable/ic_menu_search"
-        android:label="Layar Trans"
+        android:label="gametranslate"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
         <meta-data
@@ -25,6 +25,15 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".ResultActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar.Fullscreen"
+            android:launchMode="singleInstance"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|density|uiMode" />
 
         <service
             android:name=".OverlayService"
