@@ -11,6 +11,8 @@ import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.Rect
@@ -24,6 +26,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
 import android.util.DisplayMetrics
@@ -60,6 +63,8 @@ class OverlayService : Service() {
     private var bubble: View? = null
     private var overlay: ResultView? = null
     private var busy = false
+    private var pauseMode = false
+    private var pauseBlocked = false
 
     private val translators = HashMap<String, Translator>()
     private val recognizers = HashMap<String, TextRecognizer>()
@@ -130,7 +135,7 @@ class OverlayService : Service() {
         )
         val n = Notification.Builder(this, "t")
             .setSmallIcon(android.R.drawable.ic_menu_search)
-            .setContentTitle("Layar Trans aktif")
+            .setContentTitle("Game Translate aktif")
             .setContentText("Ketuk untuk berhenti")
             .setContentIntent(stopPi)
             .build()
@@ -223,6 +228,11 @@ class OverlayService : Service() {
     }
 
     private fun onTap() {
+        val cur = Shared.current
+        if (cur != null) {
+            cur.finish()
+            return
+        }
         if (overlay != null) {
             dismiss()
             return
@@ -278,41 +288,175 @@ class OverlayService : Service() {
         )
     }
 
-    private fun process(bmp: Bitmap) {
-        val src = getSharedPreferences("p", Context.MODE_PRIVATE).getString("src", "en") ?: "en"
+    /** Buang teks sampah: terlalu pendek, atau kebanyakan angka/simbol (HUD, tombol, skor, jam). */
+    private fun worthIt(t: String, src: String): Boolean {
+        val asian = src != "en"
+        val letters = t.count { it.isLetter() }
+        val visible = t.count { !it.isWhitespace() }
+        if (letters < (if (asian) 2 else 3)) return false
+        return letters * 100 / maxOf(visible, 1) >= 60
+    }
+
+    private fun ocr(src: String, bmp: Bitmap, done: (List<Pair<Rect, String>>) -> Unit) {
         val joiner = if (src == "ja" || src == "zh") "" else " "
         recognizer(src).process(InputImage.fromBitmap(bmp, 0))
             .addOnSuccessListener { text ->
-                val blocks = text.textBlocks.filter { it.boundingBox != null && it.text.isNotBlank() }
-                if (blocks.isEmpty()) {
-                    toast("Teks tidak ditemukan")
-                    busy = false
-                    return@addOnSuccessListener
+                val out = ArrayList<Pair<Rect, String>>()
+                for (b in text.textBlocks) {
+                    val r = b.boundingBox ?: continue
+                    val t = b.lines.joinToString(joiner) { it.text }.trim()
+                    if (worthIt(t, src)) out.add(Pair(r, t))
                 }
-                val tr = translator(src)
-                tr.downloadModelIfNeeded()
-                    .addOnSuccessListener {
-                        val view = ResultView(this)
-                        var left = blocks.size
-                        for (b in blocks) {
-                            val original = b.lines.joinToString(joiner) { it.text }
-                            tr.translate(original)
-                                .addOnSuccessListener { t -> view.items.add(Pair(b.boundingBox!!, gaul(t))) }
-                                .addOnCompleteListener {
-                                    left--
-                                    if (left == 0) showOverlay(view)
-                                }
-                        }
-                    }
-                    .addOnFailureListener {
-                        toast("Gagal mengunduh model bahasa. Cek internet (cukup sekali).")
-                        busy = false
-                    }
+                done(out)
             }
             .addOnFailureListener {
                 toast("OCR gagal. Coba lagi.")
-                busy = false
+                done(emptyList())
             }
+    }
+
+    /** Abu-abu + kontras tinggi, membantu font bergaris tepi atau berwarna tipis. */
+    private fun enhance(src: Bitmap): Bitmap {
+        val out = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
+        val cm = ColorMatrix().apply { setSaturation(0f) }
+        val k = 1.8f
+        val t = (-0.5f * k + 0.5f) * 255f
+        cm.postConcat(
+            ColorMatrix(
+                floatArrayOf(
+                    k, 0f, 0f, 0f, t,
+                    0f, k, 0f, 0f, t,
+                    0f, 0f, k, 0f, t,
+                    0f, 0f, 0f, 1f, 0f
+                )
+            )
+        )
+        val p = Paint().apply { colorFilter = ColorMatrixColorFilter(cm) }
+        Canvas(out).drawBitmap(src, 0f, 0f, p)
+        return out
+    }
+
+    private fun overlaps(a: Rect, b: Rect): Boolean {
+        val i = Rect()
+        if (!i.setIntersect(a, b)) return false
+        val ia = i.width().toLong() * i.height()
+        val m = minOf(a.width().toLong() * a.height(), b.width().toLong() * b.height())
+        return m > 0 && ia * 100 / m > 30
+    }
+
+    private fun process(bmp: Bitmap) {
+        val prefs = getSharedPreferences("p", Context.MODE_PRIVATE)
+        val src = prefs.getString("src", "en") ?: "en"
+        val thorough = prefs.getBoolean("thorough", false)
+        pauseMode = prefs.getBoolean("pause", false)
+        // Jeda dulu: buka layar penuh SEKARANG, OCR + terjemahan menyusul di belakang
+        if (pauseMode) openPause(bmp)
+        ocr(src, bmp) { first ->
+            if (!thorough) {
+                translateAll(src, bmp, first)
+            } else {
+                val boosted = enhance(bmp)
+                ocr(src, boosted) { second ->
+                    boosted.recycle()
+                    val merged = ArrayList<Pair<Rect, String>>(first)
+                    for (s in second) {
+                        if (merged.none { overlaps(it.first, s.first) }) merged.add(s)
+                    }
+                    translateAll(src, bmp, merged)
+                }
+            }
+        }
+    }
+
+    private fun openPause(bmp: Bitmap) {
+        Shared.frame = bmp
+        Shared.closed = false
+        pauseBlocked = false
+        val before = Shared.opens
+        try {
+            startActivity(
+                Intent(this, ResultActivity::class.java).addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION
+                )
+            )
+        } catch (e: Exception) {
+            pauseBlocked = true
+        }
+        handler.postDelayed({
+            if (Shared.opens == before && !Shared.closed) {
+                pauseBlocked = true
+                toast("Layar jeda diblokir sistem. Pakai tampilan biasa.")
+            }
+        }, 1200)
+    }
+
+    private fun translateAll(src: String, frame: Bitmap, items: List<Pair<Rect, String>>) {
+        if (items.isEmpty()) {
+            deliver(frame, emptyList())
+            return
+        }
+        val tr = translator(src)
+        tr.downloadModelIfNeeded()
+            .addOnSuccessListener {
+                val out = ArrayList<Pair<Rect, String>>()
+                var left = items.size
+                for (item in items) {
+                    tr.translate(item.second)
+                        .addOnSuccessListener { result ->
+                            val g = gaul(result)
+                            // Nama/teks yang hasilnya sama dengan aslinya tidak perlu ditampilkan
+                            if (!g.equals(item.second, ignoreCase = true)) {
+                                out.add(Pair(item.first, g))
+                            }
+                        }
+                        .addOnCompleteListener {
+                            left--
+                            if (left == 0) deliver(frame, out)
+                        }
+                }
+            }
+            .addOnFailureListener {
+                deliver(frame, emptyList(), "Gagal mengunduh model bahasa (cek internet)")
+            }
+    }
+
+    private fun deliver(
+        frame: Bitmap,
+        items: List<Pair<Rect, String>>,
+        emptyMsg: String = "Teks tidak ditemukan",
+        wait: Int = 0
+    ) {
+        if (pauseMode) {
+            if (Shared.closed) {
+                busy = false
+                return
+            }
+            val v = Shared.view
+            if (v != null) {
+                v.status = if (items.isEmpty()) "$emptyMsg (ketuk untuk menutup)" else null
+                v.items.clear()
+                v.items.addAll(items)
+                v.invalidate()
+                busy = false
+                return
+            }
+            if (!pauseBlocked && wait < 8) {
+                handler.postDelayed({ deliver(frame, items, emptyMsg, wait + 1) }, 250)
+                return
+            }
+            // Layar jeda tidak bisa dibuka: pakai jendela overlay biasa
+            Shared.frame = null
+        }
+        busy = false
+        if (items.isEmpty()) {
+            frame.recycle()
+            toast(emptyMsg)
+            return
+        }
+        val view = ResultView(this)
+        view.frame = frame
+        view.items.addAll(items)
+        showWindow(view)
     }
 
     private fun gaul(s: String): String {
@@ -321,12 +465,7 @@ class OverlayService : Service() {
         return r
     }
 
-    private fun showOverlay(view: ResultView) {
-        busy = false
-        if (view.items.isEmpty()) {
-            toast("Terjemahan kosong")
-            return
-        }
+    private fun showWindow(view: ResultView) {
         dismiss()
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -344,11 +483,15 @@ class OverlayService : Service() {
         view.setOnClickListener { dismiss() }
         wm.addView(view, lp)
         overlay = view
+        // Tertutup sendiri setelah 60 detik supaya tidak menghalangi game selamanya
+        handler.postDelayed({ if (overlay === view) dismiss() }, 60000)
     }
 
     private fun dismiss() {
         overlay?.let {
             try { wm.removeView(it) } catch (e: Exception) { }
+            it.frame?.recycle()
+            it.frame = null
         }
         overlay = null
     }
@@ -356,6 +499,7 @@ class OverlayService : Service() {
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
 
     override fun onDestroy() {
+        Shared.current?.finish()
         dismiss()
         bubble?.let {
             try { wm.removeView(it) } catch (e: Exception) { }
@@ -373,6 +517,8 @@ class OverlayService : Service() {
 class ResultView(context: Context) : View(context) {
 
     val items = ArrayList<Pair<Rect, String>>()
+    var frame: Bitmap? = null
+    var status: String? = null
 
     private val bg = Paint().apply { color = 0xE6101820.toInt() }
     private val tp = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -383,17 +529,45 @@ class ResultView(context: Context) : View(context) {
     }
 
     override fun onDraw(canvas: Canvas) {
-        val minW = (160 * resources.displayMetrics.density).toInt()
+        // Layar dibekukan: tampilkan tangkapan layar, lalu digelapkan sedikit
+        var sx = 1f
+        var sy = 1f
+        val f = frame
+        if (f != null && !f.isRecycled) {
+            sx = width.toFloat() / f.width
+            sy = height.toFloat() / f.height
+            canvas.drawBitmap(f, null, Rect(0, 0, width, height), null)
+            canvas.drawColor(0x66000000)
+        }
+        val d = resources.displayMetrics.density
+        val pad = (4 * d).toInt()
+        val minW = (160 * d).toInt()
         for ((r, t) in items) {
-            val wd = maxOf(r.width(), minW)
-            val sl = StaticLayout.Builder.obtain(t, 0, t.length, tp, wd).build()
-            val left = r.left.coerceAtMost(width - wd).coerceAtLeast(0)
-            val top = r.top.coerceAtMost(height - sl.height).coerceAtLeast(0)
+            val rl = (r.left * sx).toInt()
+            val rt = (r.top * sy).toInt()
+            val rw = (r.width() * sx).toInt()
+            val maxW = maxOf(rw, minW)
+            val textW = Math.ceil(Layout.getDesiredWidth(t, tp).toDouble()).toInt()
+            val inner = minOf(textW, maxW)
+            val sl = StaticLayout.Builder.obtain(t, 0, t.length, tp, inner).build()
+            val bw = inner + 2 * pad
+            val bh = sl.height + 2 * pad
+            val left = rl.coerceAtMost(width - bw).coerceAtLeast(0)
+            val top = rt.coerceAtMost(height - bh).coerceAtLeast(0)
             canvas.save()
             canvas.translate(left.toFloat(), top.toFloat())
-            canvas.drawRect(0f, 0f, wd.toFloat(), sl.height.toFloat(), bg)
+            canvas.drawRect(0f, 0f, bw.toFloat(), bh.toFloat(), bg)
+            canvas.translate(pad.toFloat(), pad.toFloat())
             sl.draw(canvas)
             canvas.restore()
+        }
+        val s = status
+        if (s != null) {
+            val pw = Layout.getDesiredWidth(s, tp)
+            val x = (width - pw) / 2f
+            val top = 12 * d
+            canvas.drawRect(x - 12 * d, top, x + pw + 12 * d, top + tp.textSize + 16 * d, bg)
+            canvas.drawText(s, x, top + 8 * d + tp.textSize * 0.85f, tp)
         }
     }
 }
