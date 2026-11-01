@@ -49,7 +49,15 @@ import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 
+/** Satu paragraf teks: posisi di layar, isi, tinggi baris asli, dan skor kualitas bacaan. */
+class Item(val rect: Rect, val text: String, val lineH: Int, val score: Float = 0f)
+
 class OverlayService : Service() {
+
+    companion object {
+        @Volatile
+        var running = false
+    }
 
     private lateinit var wm: WindowManager
     private val handler = Handler(Looper.getMainLooper())
@@ -65,6 +73,7 @@ class OverlayService : Service() {
     private var busy = false
     private var pauseMode = false
     private var pauseBlocked = false
+    private var tappedPause = false
 
     private val translators = HashMap<String, Translator>()
     private val recognizers = HashMap<String, TextRecognizer>()
@@ -121,6 +130,7 @@ class OverlayService : Service() {
         projection = p
         setupDisplay()
         addBubble()
+        running = true
         return START_NOT_STICKY
     }
 
@@ -288,6 +298,8 @@ class OverlayService : Service() {
         )
     }
 
+    // ---------------- OCR: baca beberapa kali, gabung per paragraf ----------------
+
     /** Buang teks sampah: terlalu pendek, atau kebanyakan angka/simbol (HUD, tombol, skor, jam). */
     private fun worthIt(t: String, src: String): Boolean {
         val asian = src != "en"
@@ -297,17 +309,123 @@ class OverlayService : Service() {
         return letters * 100 / maxOf(visible, 1) >= 60
     }
 
-    private fun ocr(src: String, bmp: Bitmap, done: (List<Pair<Rect, String>>) -> Unit) {
-        val joiner = if (src == "ja" || src == "zh") "" else " "
+    /** Perbaiki salah baca umum pada teks Latin. */
+    private fun fixToken(tok: String): String {
+        val letters = tok.count { it.isLetter() }
+        val digits = tok.count { it.isDigit() }
+        if (letters < 3 || digits != 1 || !tok.all { it.isLetterOrDigit() }) return tok
+        val upper = tok.filter { it.isLetter() }.all { it.isUpperCase() }
+        return tok.map { c ->
+            when (c) {
+                '0' -> if (upper) 'O' else 'o'
+                '1' -> if (upper) 'I' else 'l'
+                '5' -> if (upper) 'S' else 's'
+                else -> c
+            }
+        }.joinToString("")
+    }
+
+    /** TEKS HURUF BESAR SEMUA diubah ke huruf normal supaya terjemahannya lebih akurat. */
+    private fun sentenceCase(t: String): String {
+        val letters = t.filter { it.isLetter() }
+        if (letters.length < 4 || letters.any { it.isLowerCase() }) return t
+        val sb = StringBuilder()
+        var cap = true
+        for (c in t.lowercase()) {
+            if (cap && c.isLetter()) {
+                sb.append(c.uppercaseChar())
+                cap = false
+            } else {
+                sb.append(c)
+            }
+            if (c == '.' || c == '!' || c == '?') cap = true
+        }
+        return sb.toString()
+    }
+
+    private fun normalize(src: String, raw: String): String {
+        var t = raw.trim()
+        if (src != "en") return t
+        t = t.replace('|', 'I')
+        t = t.split(' ').joinToString(" ") { fixToken(it) }
+        t = sentenceCase(t)
+        t = Regex("\\bi\\b").replace(t, "I")
+        return t
+    }
+
+    /** Apakah baris b adalah lanjutan paragraf yang sama dengan baris a (a tepat di atas b)? */
+    private fun sameParagraph(a: Rect, b: Rect): Boolean {
+        val ha = maxOf(a.height(), 1)
+        val hb = maxOf(b.height(), 1)
+        val ratio = ha.toFloat() / hb
+        if (ratio < 0.6f || ratio > 1.67f) return false
+        val hMax = maxOf(ha, hb)
+        val gap = b.top - a.bottom
+        if (gap < -hMax / 2 || gap > hMax * 0.9f) return false
+        val ox = minOf(a.right, b.right) - maxOf(a.left, b.left)
+        val minW = minOf(a.width(), b.width())
+        return ox > 0.25f * minW || Math.abs(a.left - b.left) < 1.5f * hMax
+    }
+
+    /** Gabungkan baris-baris yang berdekatan menjadi paragraf utuh, urut dari atas ke bawah. */
+    private fun group(src: String, lines: List<Pair<Rect, String>>): List<Item> {
+        val asian = src != "en"
+        val sorted = lines.sortedWith(compareBy<Pair<Rect, String>>({ it.first.top }, { it.first.left }))
+        val paras = ArrayList<ArrayList<Pair<Rect, String>>>()
+        for (ln in sorted) {
+            var target: ArrayList<Pair<Rect, String>>? = null
+            for (p in paras) {
+                if (sameParagraph(p[p.size - 1].first, ln.first)) {
+                    target = p
+                    break
+                }
+            }
+            if (target == null) {
+                val np = ArrayList<Pair<Rect, String>>()
+                np.add(ln)
+                paras.add(np)
+            } else {
+                target.add(ln)
+            }
+        }
+        val out = ArrayList<Item>()
+        for (p in paras) {
+            val rect = Rect(p[0].first)
+            var sumH = 0
+            val sb = StringBuilder()
+            for ((i, ln) in p.withIndex()) {
+                rect.union(ln.first)
+                sumH += ln.first.height()
+                if (i > 0 && !asian) {
+                    if (sb.endsWith("-") && ln.second.firstOrNull()?.isLowerCase() == true) {
+                        sb.setLength(sb.length - 1)
+                    } else {
+                        sb.append(' ')
+                    }
+                }
+                sb.append(ln.second)
+            }
+            val text = normalize(src, sb.toString())
+            if (!worthIt(text, src)) continue
+            val letters = text.count { it.isLetter() }
+            val visible = text.count { !it.isWhitespace() }
+            out.add(Item(rect, text, sumH / p.size, letters.toFloat() * letters / maxOf(visible, 1)))
+        }
+        return out
+    }
+
+    private fun ocr(src: String, bmp: Bitmap, done: (List<Item>) -> Unit) {
         recognizer(src).process(InputImage.fromBitmap(bmp, 0))
             .addOnSuccessListener { text ->
-                val out = ArrayList<Pair<Rect, String>>()
+                val lines = ArrayList<Pair<Rect, String>>()
                 for (b in text.textBlocks) {
-                    val r = b.boundingBox ?: continue
-                    val t = b.lines.joinToString(joiner) { it.text }.trim()
-                    if (worthIt(t, src)) out.add(Pair(r, t))
+                    for (l in b.lines) {
+                        val r = l.boundingBox ?: continue
+                        val t = l.text.trim()
+                        if (t.isNotEmpty()) lines.add(Pair(r, t))
+                    }
                 }
-                done(out)
+                done(group(src, lines))
             }
             .addOnFailureListener {
                 toast("OCR gagal. Coba lagi.")
@@ -315,7 +433,7 @@ class OverlayService : Service() {
             }
     }
 
-    /** Abu-abu + kontras tinggi, membantu font bergaris tepi atau berwarna tipis. */
+    /** Abu-abu + kontras tinggi. */
     private fun enhance(src: Bitmap): Bitmap {
         val out = Bitmap.createBitmap(src.width, src.height, Bitmap.Config.ARGB_8888)
         val cm = ColorMatrix().apply { setSaturation(0f) }
@@ -336,6 +454,25 @@ class OverlayService : Service() {
         return out
     }
 
+    /** Sisakan hanya piksel terang (teks putih) atau gelap (teks hitam): hitam di atas putih. */
+    private fun isolate(src: Bitmap, bright: Boolean): Bitmap {
+        val wd = src.width
+        val ht = src.height
+        val px = IntArray(wd * ht)
+        src.getPixels(px, 0, wd, 0, 0, wd, ht)
+        val black = 0xFF000000.toInt()
+        val white = 0xFFFFFFFF.toInt()
+        for (i in px.indices) {
+            val c = px[i]
+            val lum = (((c shr 16) and 0xFF) * 30 + ((c shr 8) and 0xFF) * 59 + (c and 0xFF) * 11) / 100
+            val on = if (bright) lum > 185 else lum < 70
+            px[i] = if (on) black else white
+        }
+        val out = Bitmap.createBitmap(wd, ht, Bitmap.Config.ARGB_8888)
+        out.setPixels(px, 0, wd, 0, 0, wd, ht)
+        return out
+    }
+
     private fun overlaps(a: Rect, b: Rect): Boolean {
         val i = Rect()
         if (!i.setIntersect(a, b)) return false
@@ -344,28 +481,103 @@ class OverlayService : Service() {
         return m > 0 && ia * 100 / m > 30
     }
 
+    /** Dari beberapa hasil baca yang saling tumpang tindih, ambil yang skornya terbaik. */
+    private fun merge(all: List<Item>): List<Item> {
+        val sorted = all.sortedByDescending { it.score }
+        val out = ArrayList<Item>()
+        for (c in sorted) {
+            if (out.none { overlaps(it.rect, c.rect) }) out.add(c)
+        }
+        return out.sortedWith(compareBy<Item>({ it.rect.top }, { it.rect.left }))
+    }
+
+    private fun pass(
+        src: String,
+        bmp: Bitmap,
+        ids: List<Int>,
+        i: Int,
+        acc: ArrayList<Item>,
+        done: (List<Item>) -> Unit
+    ) {
+        if (i >= ids.size) {
+            done(merge(acc))
+            return
+        }
+        val img = when (ids[i]) {
+            1 -> isolate(bmp, true)
+            2 -> isolate(bmp, false)
+            3 -> enhance(bmp)
+            else -> bmp
+        }
+        ocr(src, img) { found ->
+            if (img !== bmp) img.recycle()
+            acc.addAll(found)
+            pass(src, bmp, ids, i + 1, acc, done)
+        }
+    }
+
     private fun process(bmp: Bitmap) {
         val prefs = getSharedPreferences("p", Context.MODE_PRIVATE)
-        val src = prefs.getString("src", "en") ?: "en"
-        val thorough = prefs.getBoolean("thorough", false)
-        pauseMode = prefs.getBoolean("pause", false)
-        // Jeda dulu: buka layar penuh SEKARANG, OCR + terjemahan menyusul di belakang
-        if (pauseMode) openPause(bmp)
-        ocr(src, bmp) { first ->
-            if (!thorough) {
-                translateAll(src, bmp, first)
-            } else {
-                val boosted = enhance(bmp)
-                ocr(src, boosted) { second ->
-                    boosted.recycle()
-                    val merged = ArrayList<Pair<Rect, String>>(first)
-                    for (s in second) {
-                        if (merged.none { overlaps(it.first, s.first) }) merged.add(s)
-                    }
-                    translateAll(src, bmp, merged)
-                }
-            }
+        if (prefs.getBoolean("calibrate", false)) {
+            startCalibration(bmp)
+            return
         }
+        val src = prefs.getString("src", "en") ?: "en"
+        val thorough = prefs.getBoolean("thorough", true)
+        val tapMode = prefs.getBoolean("tappause", false)
+        pauseMode = prefs.getBoolean("pause", false) && !tapMode
+        // Jeda dulu, OCR + terjemahan menyusul di belakang
+        if (tapMode) pauseTap()
+        if (pauseMode) openPause(bmp)
+        val ids = if (thorough) listOf(0, 1, 2, 3) else listOf(0)
+        pass(src, bmp, ids, 0, ArrayList()) { items ->
+            translateAll(src, bmp, items)
+        }
+    }
+
+    // ---- Ketuk tombol pause game lewat layanan Aksesibilitas (opsional, default mati) ----
+
+    private fun tapSaved(): Boolean {
+        val p = getSharedPreferences("p", Context.MODE_PRIVATE)
+        if (!p.contains("fx")) return false
+        return TapService.tap(p.getFloat("fx", 0f) * w, p.getFloat("fy", 0f) * h)
+    }
+
+    private fun pauseTap() {
+        val p = getSharedPreferences("p", Context.MODE_PRIVATE)
+        if (!p.contains("fx")) {
+            toast("Posisi tombol pause belum diatur")
+            return
+        }
+        if (tapSaved()) tappedPause = true else toast("Layanan Aksesibilitas belum aktif")
+    }
+
+    private fun resumeIfNeeded() {
+        if (!tappedPause) return
+        tappedPause = false
+        if (getSharedPreferences("p", Context.MODE_PRIVATE).getBoolean("tapback", false)) {
+            handler.postDelayed({ tapSaved() }, 250)
+        }
+    }
+
+    private fun startCalibration(bmp: Bitmap) {
+        busy = false
+        val view = ResultView(this)
+        view.frame = bmp
+        view.status = "Ketuk tombol PAUSE game di gambar ini"
+        view.setOnTouchListener { v, e ->
+            if (e.action == MotionEvent.ACTION_UP) {
+                getSharedPreferences("p", Context.MODE_PRIVATE).edit()
+                    .putFloat("fx", e.x / v.width)
+                    .putFloat("fy", e.y / v.height)
+                    .putBoolean("calibrate", false)
+                    .apply()
+                toast("Posisi tombol pause tersimpan")
+                dismiss()
+            }
+            true
+        }
+        showWindow(view)
     }
 
     private fun openPause(bmp: Bitmap) {
@@ -390,7 +602,9 @@ class OverlayService : Service() {
         }, 1200)
     }
 
-    private fun translateAll(src: String, frame: Bitmap, items: List<Pair<Rect, String>>) {
+    // ---------------- Terjemahan ----------------
+
+    private fun translateAll(src: String, frame: Bitmap, items: List<Item>) {
         if (items.isEmpty()) {
             deliver(frame, emptyList())
             return
@@ -398,15 +612,15 @@ class OverlayService : Service() {
         val tr = translator(src)
         tr.downloadModelIfNeeded()
             .addOnSuccessListener {
-                val out = ArrayList<Pair<Rect, String>>()
+                val out = ArrayList<Item>()
                 var left = items.size
                 for (item in items) {
-                    tr.translate(item.second)
+                    tr.translate(item.text)
                         .addOnSuccessListener { result ->
                             val g = gaul(result)
                             // Nama/teks yang hasilnya sama dengan aslinya tidak perlu ditampilkan
-                            if (!g.equals(item.second, ignoreCase = true)) {
-                                out.add(Pair(item.first, g))
+                            if (!g.equals(item.text, ignoreCase = true)) {
+                                out.add(Item(item.rect, g, item.lineH))
                             }
                         }
                         .addOnCompleteListener {
@@ -422,7 +636,7 @@ class OverlayService : Service() {
 
     private fun deliver(
         frame: Bitmap,
-        items: List<Pair<Rect, String>>,
+        items: List<Item>,
         emptyMsg: String = "Teks tidak ditemukan",
         wait: Int = 0
     ) {
@@ -450,6 +664,7 @@ class OverlayService : Service() {
         busy = false
         if (items.isEmpty()) {
             frame.recycle()
+            resumeIfNeeded()
             toast(emptyMsg)
             return
         }
@@ -466,7 +681,7 @@ class OverlayService : Service() {
     }
 
     private fun showWindow(view: ResultView) {
-        dismiss()
+        closeWindow()
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -487,7 +702,7 @@ class OverlayService : Service() {
         handler.postDelayed({ if (overlay === view) dismiss() }, 60000)
     }
 
-    private fun dismiss() {
+    private fun closeWindow() {
         overlay?.let {
             try { wm.removeView(it) } catch (e: Exception) { }
             it.frame?.recycle()
@@ -496,11 +711,18 @@ class OverlayService : Service() {
         overlay = null
     }
 
+    private fun dismiss() {
+        val had = overlay != null
+        closeWindow()
+        if (had) resumeIfNeeded()
+    }
+
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
 
     override fun onDestroy() {
+        running = false
         Shared.current?.finish()
-        dismiss()
+        closeWindow()
         bubble?.let {
             try { wm.removeView(it) } catch (e: Exception) { }
         }
@@ -516,12 +738,13 @@ class OverlayService : Service() {
 
 class ResultView(context: Context) : View(context) {
 
-    val items = ArrayList<Pair<Rect, String>>()
+    val items = ArrayList<Item>()
     var frame: Bitmap? = null
     var status: String? = null
 
     private val bg = Paint().apply { color = 0xE6101820.toInt() }
-    private val tp = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val tp = TextPaint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+    private val sp = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
         textSize = TypedValue.applyDimension(
             TypedValue.COMPLEX_UNIT_SP, 14f, context.resources.displayMetrics
@@ -539,10 +762,17 @@ class ResultView(context: Context) : View(context) {
             canvas.drawBitmap(f, null, Rect(0, 0, width, height), null)
             canvas.drawColor(0x66000000)
         }
-        val d = resources.displayMetrics.density
+        val dm = resources.displayMetrics
+        val d = dm.density
         val pad = (4 * d).toInt()
         val minW = (160 * d).toInt()
-        for ((r, t) in items) {
+        val minSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 11f, dm)
+        val maxSize = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, 26f, dm)
+        for (item in items) {
+            val r = item.rect
+            val t = item.text
+            // Ukuran teks hasil menyesuaikan ukuran teks asli di game
+            tp.textSize = (item.lineH * sy * 0.62f).coerceIn(minSize, maxSize)
             val rl = (r.left * sx).toInt()
             val rt = (r.top * sy).toInt()
             val rw = (r.width() * sx).toInt()
@@ -563,11 +793,11 @@ class ResultView(context: Context) : View(context) {
         }
         val s = status
         if (s != null) {
-            val pw = Layout.getDesiredWidth(s, tp)
+            val pw = Layout.getDesiredWidth(s, sp)
             val x = (width - pw) / 2f
             val top = 12 * d
-            canvas.drawRect(x - 12 * d, top, x + pw + 12 * d, top + tp.textSize + 16 * d, bg)
-            canvas.drawText(s, x, top + 8 * d + tp.textSize * 0.85f, tp)
+            canvas.drawRect(x - 12 * d, top, x + pw + 12 * d, top + sp.textSize + 16 * d, bg)
+            canvas.drawText(s, x, top + 8 * d + sp.textSize * 0.85f, sp)
         }
     }
 }
