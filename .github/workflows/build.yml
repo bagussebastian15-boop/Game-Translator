@@ -1,22 +1,53 @@
-name: Build APK
+name: build
 on:
-  workflow_dispatch:
   push:
-    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
+      # Proyek di root repo, ATAU repo hanya berisi file .zip proyek (diekstrak otomatis).
+      - name: Siapkan proyek
+        run: |
+          set -euo pipefail
+          if [ ! -f settings.gradle.kts ]; then
+            Z="$(ls -1 *.zip 2>/dev/null | head -n1 || true)"
+            [ -n "$Z" ] && { rm -rf _project && mkdir _project && unzip -q "$Z" -d _project; }
+          fi
+          S="$(find . -name settings.gradle.kts | head -n1)"
+          [ -z "$S" ] && { echo "settings.gradle.kts tidak ditemukan"; exit 1; }
+          echo "PROJECT_DIR=$(dirname "$S")" >> "$GITHUB_ENV"
+
       - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
+        with: { distribution: temurin, java-version: 17 }
       - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: 8.9
-      - run: gradle assembleDebug
+        with: { gradle-version: 8.9 }
+      - name: Terima lisensi Android SDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Build APK release (kecil, R8)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Rapikan nama APK
+        run: |
+          cd "$PROJECT_DIR/app/build/outputs/apk/release"
+          for f in app-*-release.apk; do mv "$f" "PenerjemahLayar-${f#app-}"; done
+          ls -lh *.apk
+
       - uses: actions/upload-artifact@v4
         with:
-          name: LayarTrans-apk
-          path: app/build/outputs/apk/debug/*.apk
+          name: PenerjemahLayar
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/*.apk
+
+      # Setiap kali push tag "v*" (mis. v1.0), APK otomatis jadi Release yang bisa diunduh langsung dari HP.
+      - name: Publikasikan Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/release/*.apk
